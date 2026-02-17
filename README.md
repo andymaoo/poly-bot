@@ -50,7 +50,6 @@ src/
 
 - Python 3.10+
 - Polymarket account with API credentials
-- Funded Polygon wallet
 
 ### Installation
 
