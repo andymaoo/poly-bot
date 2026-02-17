@@ -10,7 +10,6 @@ The bot targets BTC 15-minute up/down binary markets on Polymarket. It places 45
 - **Auto-Rotation** — detects and places orders on upcoming 15-minute markets
 - **WebSocket Price Feed** — real-time order book monitoring with auto-reconnect
 - **Auto-Redeem** — redeems resolved positions via Polymarket's gasless builder relayer
-- **Bail-Out Logic** — if one side spikes above 72c and the other is unfilled, sells the filled side to cut losses
 
 ## Project Structure
 
