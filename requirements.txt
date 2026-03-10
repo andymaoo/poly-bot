@@ -1,0 +1,7 @@
+httpx
+python-dotenv
+py-clob-client
+py-builder-relayer-client
+web3
+eth-abi
+websockets

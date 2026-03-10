@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket Auto-Betting Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/poly-autobetting
+EnvironmentFile=/home/ubuntu/poly-autobetting/.env
+ExecStart=/home/ubuntu/poly-autobetting/venv/bin/python scripts/place_45.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=poly-autobetting
+
+[Install]
+WantedBy=multi-user.target
