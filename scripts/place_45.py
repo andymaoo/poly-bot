@@ -167,6 +167,7 @@ class Market:
     unwind_order_id: str | None = None
     last_unwind_matched: float = 0.0
     unwind_target_shares: float = 0.0
+    unwind_entry_vwap: float = 0.0
 
 
 # ── SDK Init ────────────────────────────────────────────────────────────
@@ -355,6 +356,18 @@ def cancel_market_orders(client, token_ids: set):
         log.error("  Cancel failed: %s", e)
 
 
+def cancel_order_by_id(client, order_id: str) -> bool:
+    """Cancel a single order by ID."""
+    if DRY_RUN:
+        return True
+    try:
+        client.cancel_orders([order_id])
+        return True
+    except Exception as e:
+        log.error("  Cancel order %s failed: %s", order_id[:12], e)
+        return False
+
+
 # ── Balance / Fill Checks ───────────────────────────────────────────────
 
 def check_token_balance(client, token_id: str) -> float:
@@ -524,7 +537,7 @@ def evaluate_entry(client, mkt: Market, cfg: BotConfig) -> tuple[bool, dict]:
         # Approximate EV of one-sided unwind if it occurs.
         ev_unwind = base_edge * 0.5
 
-        ev_entry = p_both * pi_pair + p_one * ev_unwind - 2 * f_entry
+        ev_entry = p_both * pi_pair + p_one * ev_unwind
 
         # In live mode, require positive EV; in dry-run always allow entry so we
         # can observe what would have happened.
@@ -720,6 +733,7 @@ def execute_unwind(client, mkt: Market, cfg: BotConfig) -> None:
             journal.unwind_sold(mkt.ts, mkt.filled_side, filled_shares, sell_oid)
         return
 
+    mkt.unwind_entry_vwap = mkt.position.up_vwap if is_up else mkt.position.dn_vwap
     sell_oid = sell_at_bid(
         client, filled_token, filled_shares, side_label,
         expiration_s=cfg.order_expiry_seconds,
@@ -875,6 +889,10 @@ async def run():
                              mkt.slug, up_bal, dn_bal)
                     mkt.position.up_shares = up_bal
                     mkt.position.dn_shares = dn_bal
+                    mkt.position.up_cost = up_bal * cfg.price if up_bal > 0 else 0.0
+                    mkt.position.dn_cost = dn_bal * cfg.price if dn_bal > 0 else 0.0
+                    mkt.up_limit_price = cfg.price
+                    mkt.dn_limit_price = cfg.price
                     if up_bal > 0 and dn_bal > 0:
                         mkt.state = MState.BOTH_FILLED
                     else:
@@ -896,10 +914,13 @@ async def run():
                             mkt.state = MState.ENTERED
                             mkt.entry_time = time.time()
                             for o in existing:
+                                price = float(o.get("price", cfg.price)) if o.get("price") else cfg.price
                                 if o.get("asset_id") == mkt.up_token:
                                     mkt.up_order_id = o.get("id")
+                                    mkt.up_limit_price = price
                                 elif o.get("asset_id") == mkt.dn_token:
                                     mkt.dn_order_id = o.get("id")
+                                    mkt.dn_limit_price = price
                             continue
                     except Exception:
                         pass
@@ -1023,6 +1044,77 @@ async def run():
                         details.get("p_fill", 0),
                         details.get("time_remaining", 0),
                     )
+
+            # ── UNWINDING: poll unwind sell order until fully filled ──
+            elif mkt.state == MState.UNWINDING:
+                if not mkt.unwind_order_id:
+                    mkt.state = MState.UNWOUND
+                    continue
+                time_remaining = (mkt.ts + MARKET_DURATION) - now
+                is_up = mkt.filled_side == "UP"
+                filled_token = mkt.up_token if is_up else mkt.dn_token
+                side_label = "UP" if is_up else "DN"
+
+                new_matched = get_order_fill(client, mkt.unwind_order_id)
+                delta = new_matched - mkt.last_unwind_matched
+
+                if delta > 0.001:
+                    mkt.last_unwind_matched = new_matched
+                    if is_up:
+                        if mkt.position.up_shares > 0:
+                            cost_ratio = mkt.position.up_cost / mkt.position.up_shares
+                            mkt.position.up_cost -= delta * cost_ratio
+                        mkt.position.up_shares = max(0.0, mkt.position.up_shares - delta)
+                    else:
+                        if mkt.position.dn_shares > 0:
+                            cost_ratio = mkt.position.dn_cost / mkt.position.dn_shares
+                            mkt.position.dn_cost -= delta * cost_ratio
+                        mkt.position.dn_shares = max(0.0, mkt.position.dn_shares - delta)
+                    log.info("  [%s] UNWIND fill: %s +%.1f (total matched: %.1f)",
+                             mkt.slug, side_label, delta, new_matched)
+
+                if new_matched >= mkt.unwind_target_shares - 0.001:
+                    target_shares = mkt.unwind_target_shares
+                    a = mkt.unwind_entry_vwap
+                    oid_cleared = mkt.unwind_order_id
+                    mkt.state = MState.UNWOUND
+                    if is_up:
+                        mkt.position.up_shares = 0.0
+                        mkt.position.up_cost = 0.0
+                    else:
+                        mkt.position.dn_shares = 0.0
+                        mkt.position.dn_cost = 0.0
+                    exit_price = ws_feed.get_best_bid(filled_token) if ws_feed else None
+                    if journal:
+                        journal.unwind_sold(
+                            mkt.ts, mkt.filled_side, target_shares,
+                            oid_cleared, exit_price=exit_price,
+                        )
+                    mkt.unwind_order_id = None
+                    mkt.unwind_target_shares = 0.0
+                    mkt.last_unwind_matched = 0.0
+                    if alerts:
+                        fee = cfg.fee_per_share
+                        pnl = (exit_price - a - fee) * target_shares if exit_price else 0.0
+                        await alerts.v2_unwind(
+                            mkt.slug, "unwind_filled", mkt.filled_side,
+                            target_shares, exit_price or 0.0, pnl,
+                        )
+                    log.info("  [%s] UNWOUND (sell order %s fully filled)", mkt.slug, oid_cleared[:12] if oid_cleared else "?")
+
+                elif time_remaining < 60 and new_matched < mkt.unwind_target_shares - 0.001:
+                    remaining = mkt.unwind_target_shares - new_matched
+                    if cancel_order_by_id(client, mkt.unwind_order_id):
+                        new_oid = sell_at_bid(
+                            client, filled_token, remaining, side_label,
+                            expiration_s=cfg.order_expiry_seconds,
+                        )
+                        if new_oid:
+                            mkt.unwind_order_id = new_oid
+                            mkt.unwind_target_shares = remaining
+                            mkt.last_unwind_matched = 0.0
+                            log.info("  [%s] UNWIND replace (stale, %ds left, %.1f shares)",
+                                     mkt.slug, int(time_remaining), remaining)
 
             # ── BOTH_FILLED / UNWOUND / DONE: handled by redeem or no-op ──
 
