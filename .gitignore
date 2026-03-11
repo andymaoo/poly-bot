@@ -1,6 +1,10 @@
 .env
 *.pem
 venv/
+events.jsonl
+trade_journal.jsonl
+dryrun_report.json
+data/
 __pycache__/
 *.pyc
 *.pyo

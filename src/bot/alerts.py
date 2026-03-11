@@ -111,6 +111,59 @@ class AlertManager:
     async def heartbeat_status(self, phase: str, position_summary: str) -> bool:
         return await self.send(f"HB: {phase} | {position_summary}")
 
+    # ── place_45-specific alerts ─────────────────────────────────────
+
+    async def v2_entry(self, slug: str, edge: float, combined_ask: float,
+                       price: float, shares: float, ev: float) -> bool:
+        text = (
+            f"<b>V2 ENTRY</b>\n"
+            f"Market: <code>{slug}</code>\n"
+            f"Edge: {edge:+.4f} (ask: {combined_ask:.3f})\n"
+            f"Orders: {shares:.0f} x 2 @ {price:.2f}c\n"
+            f"EV: {ev:.4f}  |  Cost: ${shares * price * 2:.2f}"
+        )
+        return await self.send(text)
+
+    async def v2_fill(self, slug: str, side: str, shares: float,
+                      price: float, both: bool, hedged_profit: float = 0) -> bool:
+        if both:
+            text = (
+                f"<b>V2 BOTH FILLED</b>\n"
+                f"Market: <code>{slug}</code>\n"
+                f"Hedged profit: ${hedged_profit:.2f}"
+            )
+        else:
+            text = (
+                f"<b>V2 FILL</b> ({side})\n"
+                f"Market: <code>{slug}</code>\n"
+                f"Shares: {shares:.1f} @ {price:.2f}c"
+            )
+        return await self.send(text)
+
+    async def v2_unwind(self, slug: str, trigger: str, side: str,
+                        shares: float, exit_price: float, pnl: float) -> bool:
+        text = (
+            f"<b>V2 UNWIND</b>\n"
+            f"Market: <code>{slug}</code>\n"
+            f"Trigger: {trigger}\n"
+            f"Sold: {shares:.1f} {side} @ {exit_price:.2f}\n"
+            f"PnL: ${pnl:+.2f}"
+        )
+        return await self.send(text)
+
+    async def v2_heartbeat(self, stats: dict) -> bool:
+        text = (
+            f"<b>V2 HEARTBEAT</b>\n"
+            f"Entered: {stats.get('entered', 0)} | "
+            f"Filled: {stats.get('filled', 0)} | "
+            f"Both: {stats.get('both_filled', 0)}\n"
+            f"No-fills: {stats.get('no_fills', 0)} | "
+            f"Unwound: {stats.get('unwound', 0)}\n"
+            f"PnL: ${stats.get('realized_pnl', 0):+.2f} | "
+            f"Capital: ${stats.get('capital_deployed', 0):.2f}"
+        )
+        return await self.send(text)
+
     async def check_kill_command(self) -> bool:
         """Poll for /kill command in Telegram chat."""
         if not self._enabled:
