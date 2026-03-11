@@ -208,11 +208,7 @@ pip install -r requirements.txt
 
 ### Configuration
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
+Create a `.env` file with:
 
 | Variable | Description |
 |----------|-------------|

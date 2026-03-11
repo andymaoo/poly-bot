@@ -1,9 +1,10 @@
 {
-  "price": 0.47,
+  "price": 0.46,
   "shares_per_side": 5,
   "bail_price": 0.72,
-  "max_combined_ask": 1.01,
-  "order_expiry_seconds": 600,
+  "max_combined_ask": 1.02,
+  "min_ev_entry": -0.01,
+  "order_expiry_seconds": 2700,
   "asset": "btc",
   "bail_enabled": false,
   "min_entry_time_remaining": 180,
