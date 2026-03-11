@@ -2,8 +2,17 @@
   "price": 0.45,
   "shares_per_side": 60,
   "bail_price": 0.72,
-  "max_combined_ask": 1.02,
-  "order_expiry_seconds": 2700,
+  "max_combined_ask": 0.98,
+  "order_expiry_seconds": 300,
   "asset": "btc",
-  "bail_enabled": false
+  "bail_enabled": true,
+  "enable_aggressive_repair": true,
+  "max_one_sided_seconds": 20,
+  "recheck_interval_seconds": 2,
+  "dry_run": false,
+  "entry_cutoff_seconds_before_close": 60,
+  "min_repair_shares": 1.0,
+  "min_repair_edge_per_share": 0.0,
+  "max_repair_attempts": 2,
+  "max_unwind_attempts": 2
 }
