@@ -12,6 +12,8 @@
   "dry_run": false,
   "entry_cutoff_seconds_before_close": 60,
   "min_repair_shares": 1.0,
+  "repair_trigger_shares": 1.0,
+  "must_flatten_shares_before_close": 0.1,
   "min_repair_edge_per_share": 0.0,
   "max_repair_attempts": 2,
   "max_unwind_attempts": 2
