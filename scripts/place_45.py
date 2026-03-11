@@ -54,6 +54,7 @@ class BotConfig:
     shares_per_side: float = 60
     bail_price: float = 0.72
     max_combined_ask: float = 1.02
+    min_ev_entry: float = 0.0
     order_expiry_seconds: int = 2700
     asset: str = "btc"
     bail_enabled: bool = False
@@ -252,10 +253,12 @@ def init_relayer():
 # ── Market Discovery ────────────────────────────────────────────────────
 
 def next_market_timestamps(now_ts: int) -> list[int]:
+    """Return [previous, current, next, next+1] 15-min slot timestamps.
+    Includes the market 30–45 min out so we can place orders earlier."""
     ts = REF_15M
     while ts < now_ts:
         ts += 900
-    return [ts - 900, ts, ts + 900]
+    return [ts - 900, ts, ts + 900, ts + 1800]
 
 
 async def get_market_info(slug: str) -> dict:
@@ -506,23 +509,24 @@ def evaluate_entry(client, mkt: Market, cfg: BotConfig) -> tuple[bool, dict]:
         combined_ask = up_best_ask + dn_best_ask
         edge = 1.0 - combined_ask
 
-        if combined_ask >= cfg.max_combined_ask:
-            return False, {
-                "reject": "soft", "reason": "no_edge",
-                "combined_ask": round(combined_ask, 4), "edge": round(edge, 4),
-                "book_snapshot": book_snapshot,
-            }
+        # --- Entry gates commented out for 1-side sell/hold testing ---
+        # if combined_ask >= cfg.max_combined_ask:
+        #     return False, {
+        #         "reject": "soft", "reason": "no_edge",
+        #         "combined_ask": round(combined_ask, 4), "edge": round(edge, 4),
+        #         "book_snapshot": book_snapshot,
+        #     }
 
         up_depth = sum(float(a.size) for a in up_book.asks[:3]) if up_book.asks else 0
         dn_depth = sum(float(a.size) for a in dn_book.asks[:3]) if dn_book.asks else 0
-        if up_depth < 10 or dn_depth < 10:
-            return False, {
-                "reject": "soft", "reason": "thin_book",
-                "up_depth": round(up_depth, 1), "dn_depth": round(dn_depth, 1),
-                "book_snapshot": book_snapshot,
-            }
+        # if up_depth < 10 or dn_depth < 10:
+        #     return False, {
+        #         "reject": "soft", "reason": "thin_book",
+        #         "up_depth": round(up_depth, 1), "dn_depth": round(dn_depth, 1),
+        #         "book_snapshot": book_snapshot,
+        #     }
 
-        # --- EV-based gate (heuristic) ---
+        # --- EV-based gate (heuristic) - commented out for testing ---
         # Approximate per-pair profit if both legs fill at the entry price.
         f_entry = cfg.fee_per_share
         pi_pair = 1.0 - cfg.price - cfg.price - 2 * f_entry
@@ -538,22 +542,22 @@ def evaluate_entry(client, mkt: Market, cfg: BotConfig) -> tuple[bool, dict]:
         ev_unwind = base_edge * 0.5
 
         ev_entry = p_both * pi_pair + p_one * ev_unwind
+        min_ev = cfg.min_ev_entry
 
-        # In live mode, require positive EV; in dry-run always allow entry so we
-        # can observe what would have happened.
-        if not DRY_RUN and ev_entry <= 0.0:
-            return False, {
-                "reject": "soft", "reason": "negative_ev",
-                "combined_ask": round(combined_ask, 4), "edge": round(edge, 4),
-                "ev_entry": round(ev_entry, 4),
-                "p_both": round(p_both, 4), "p_one": round(p_one, 4), "p_none": round(p_none, 4),
-                "book_snapshot": book_snapshot,
-            }
+        # EV gate commented out for 1-side sell/hold testing
+        # if not DRY_RUN and ev_entry <= min_ev:
+        #     return False, {
+        #         "reject": "soft", "reason": "negative_ev",
+        #         "combined_ask": round(combined_ask, 4), "edge": round(edge, 4),
+        #         "ev_entry": round(ev_entry, 4), "min_ev_entry": round(min_ev, 4),
+        #         "p_both": round(p_both, 4), "p_one": round(p_one, 4), "p_none": round(p_none, 4),
+        #         "book_snapshot": book_snapshot,
+        #     }
 
         return True, {
             "combined_ask": round(combined_ask, 4), "edge": round(edge, 4),
             "up_depth": round(up_depth, 1), "dn_depth": round(dn_depth, 1),
-            "ev_entry": round(ev_entry, 4),
+            "ev_entry": round(ev_entry, 4), "min_ev_entry": round(min_ev, 4),
             "p_both": round(p_both, 4), "p_one": round(p_one, 4), "p_none": round(p_none, 4),
             "book_snapshot": book_snapshot,
         }
@@ -901,6 +905,8 @@ async def run():
                         mkt.one_sided_since = time.time()
                     continue
 
+                # Cancel any existing live orders for this market so we place fresh ones.
+                # (Previously we skipped to ENTERED; now we always evaluate and place.)
                 if not DRY_RUN:
                     try:
                         live_orders = client.get_orders()
@@ -909,19 +915,9 @@ async def run():
                                     if o.get("status") == "LIVE"
                                     and o.get("asset_id") in tokens]
                         if existing:
-                            log.info("  [%s] Found %d live order(s) -> ENTERED",
+                            log.info("  [%s] Cancelling %d stale order(s), placing fresh",
                                      mkt.slug, len(existing))
-                            mkt.state = MState.ENTERED
-                            mkt.entry_time = time.time()
-                            for o in existing:
-                                price = float(o.get("price", cfg.price)) if o.get("price") else cfg.price
-                                if o.get("asset_id") == mkt.up_token:
-                                    mkt.up_order_id = o.get("id")
-                                    mkt.up_limit_price = price
-                                elif o.get("asset_id") == mkt.dn_token:
-                                    mkt.dn_order_id = o.get("id")
-                                    mkt.dn_limit_price = price
-                            continue
+                            cancel_market_orders(client, tokens)
                     except Exception:
                         pass
 
