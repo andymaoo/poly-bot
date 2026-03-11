@@ -5,5 +5,9 @@
   "max_combined_ask": 1.02,
   "order_expiry_seconds": 2700,
   "asset": "btc",
-  "bail_enabled": false
+  "bail_enabled": false,
+  "min_entry_time_remaining": 120,
+  "unwind_hard_timeout": 90,
+  "unwind_buffer": 0.01,
+  "fee_per_share": 0.01
 }
