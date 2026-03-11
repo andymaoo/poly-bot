@@ -12,16 +12,20 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass, asdict
+from typing import Any, Dict
 
 import httpx
 
 # Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from src.bot.ws_book_feed import WSBookFeed
 
 from dotenv import load_dotenv
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,10 +34,52 @@ logging.basicConfig(
 )
 log = logging.getLogger("place45")
 
-# --- Config ---
-PRICE = 0.45
-SHARES_PER_SIDE = 100
-BAIL_PRICE = 0.72        # if one side > 72c and other side unfilled → bail out
+
+@dataclass
+class BotConfig:
+    price: float = 0.45
+    shares_per_side: float = 60
+    bail_price: float = 0.72
+    max_combined_ask: float = 1.02
+    order_expiry_seconds: int = 2700
+    asset: str = "btc"
+    bail_enabled: bool = False
+
+
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
+EVENTS_PATH = os.path.join(PROJECT_ROOT, "events.jsonl")
+
+
+def load_config() -> BotConfig:
+    """Load config from config.json, falling back to defaults."""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    cfg = BotConfig()
+    for field in asdict(cfg).keys():
+        if field in data:
+            setattr(cfg, field, data[field])
+    return cfg
+
+
+def emit_event(event_type: str, payload: Dict[str, Any]) -> None:
+    """Append a single JSON event line to events.jsonl. Best-effort only."""
+    event = {
+        "type": event_type,
+        "ts": int(time.time()),
+        "payload": payload,
+    }
+    try:
+        with open(EVENTS_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except Exception:
+        # Logging is already going to journal; avoid noisy errors here.
+        pass
+
+
+# --- Constants (configurable via BotConfig) ---
 GAMMA_URL = "https://gamma-api.polymarket.com"
 REF_15M = 1771268400     # known 15m epoch anchor
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -85,7 +131,7 @@ def init_clob_client():
         "https://clob.polymarket.com",
         chain_id=137,
         key=pk,
-        signature_type=2,
+        signature_type=1,
         **kwargs,
     )
 
@@ -125,12 +171,12 @@ def init_relayer():
     )
 
 
-def place_order(client, token_id: str, side_label: str, shares: float, price: float):
+def place_order(client, token_id: str, side_label: str, shares: float, price: float, expiration_s: int):
     """Place a single limit buy order. Returns order ID or None."""
     from py_clob_client.order_builder.constants import BUY
     from py_clob_client.clob_types import OrderArgs, OrderType
 
-    expiration = int(time.time()) + 3600  # 1 hour
+    expiration = int(time.time()) + int(expiration_s)
     order_args = OrderArgs(
         token_id=token_id,
         price=price,
@@ -152,7 +198,7 @@ def place_order(client, token_id: str, side_label: str, shares: float, price: fl
     return None
 
 
-def sell_at_bid(client, token_id: str, shares: float, side_label: str) -> str | None:
+def sell_at_bid(client, token_id: str, shares: float, side_label: str, expiration_s: int = 300) -> str | None:
     """Place a limit SELL at the current best bid. Returns order ID or None."""
     from py_clob_client.order_builder.constants import SELL
     from py_clob_client.clob_types import OrderArgs, OrderType
@@ -170,7 +216,7 @@ def sell_at_bid(client, token_id: str, shares: float, side_label: str) -> str | 
             price=best_bid,
             size=round(shares, 1),
             side=SELL,
-            expiration=int(time.time()) + 300,  # 5 min expiry
+            expiration=int(time.time()) + int(expiration_s),
         )
         signed = client.create_order(order_args)
         result = client.post_order(signed, OrderType.GTD)
@@ -201,7 +247,7 @@ def cancel_market_orders(client, token_ids: set):
 
 
 async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
-    """If one side > 72c and other side has 0 balance → cancel + sell filled side."""
+    """If one side > bail_price and other side has 0 balance → cancel + sell filled side."""
     for ts, info in list(past_markets.items()):
         if info.get("bailed") or info.get("redeemed"):
             continue
@@ -220,7 +266,9 @@ async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
         if up_ask is None or dn_ask is None:
             continue  # no WS data yet
 
-        if up_ask <= BAIL_PRICE and dn_ask <= BAIL_PRICE:
+        # Bail price and behavior are config-driven; this function is only called when enabled.
+        cfg = load_config()
+        if up_ask <= cfg.bail_price and dn_ask <= cfg.bail_price:
             continue  # no bail needed
 
         # Price triggered — check balances via CLOB API
@@ -232,18 +280,38 @@ async def check_bail_out(client, ws_feed: WSBookFeed, past_markets: dict):
 
         bail = False
         # DN expensive (DN winning) + we only hold UP (DN unfilled) → sell UP
-        if dn_ask > BAIL_PRICE and dn_bal == 0 and up_bal > 0:
+        if dn_ask > cfg.bail_price and dn_bal == 0 and up_bal > 0:
             log.info("  BAIL: DN ask=%.2f > %.2f, DN unfilled. Selling UP %.0f shares",
-                     dn_ask, BAIL_PRICE, up_bal)
+                     dn_ask, cfg.bail_price, up_bal)
             cancel_market_orders(client, {up_token, dn_token})
-            sell_at_bid(client, up_token, up_bal, "UP")
+            sell_at_bid(client, up_token, up_bal, "UP", expiration_s=cfg.order_expiry_seconds)
+            emit_event(
+                "bailed",
+                {
+                    "market_ts": ts,
+                    "side_sold": "UP",
+                    "shares": up_bal,
+                    "trigger_ask": dn_ask,
+                    "bail_price": cfg.bail_price,
+                },
+            )
             bail = True
         # UP expensive (UP winning) + we only hold DN (UP unfilled) → sell DN
-        elif up_ask > BAIL_PRICE and up_bal == 0 and dn_bal > 0:
+        elif up_ask > cfg.bail_price and up_bal == 0 and dn_bal > 0:
             log.info("  BAIL: UP ask=%.2f > %.2f, UP unfilled. Selling DN %.0f shares",
-                     up_ask, BAIL_PRICE, dn_bal)
+                     up_ask, cfg.bail_price, dn_bal)
             cancel_market_orders(client, {up_token, dn_token})
-            sell_at_bid(client, dn_token, dn_bal, "DN")
+            sell_at_bid(client, dn_token, dn_bal, "DN", expiration_s=cfg.order_expiry_seconds)
+            emit_event(
+                "bailed",
+                {
+                    "market_ts": ts,
+                    "side_sold": "DOWN",
+                    "shares": dn_bal,
+                    "trigger_ask": up_ask,
+                    "bail_price": cfg.bail_price,
+                },
+            )
             bail = True
 
         if bail:
@@ -282,25 +350,46 @@ def redeem_market(relayer, condition_id: str, neg_risk: bool) -> bool:
 
     try:
         resp = relayer.execute([tx], "Redeem positions")
-        log.info("  Redeem submitted: %s", resp.transaction_id)
+        tx_id = getattr(resp, "transaction_id", None) or getattr(resp, "id", None)
+        log.info("  Redeem submitted: %s", tx_id)
+        emit_event("redeem_submitted", {"tx_id": tx_id})
 
         # Poll for result
         for _ in range(20):
             time.sleep(3)
-            status = relayer.get_transaction(resp.transaction_id)
+            status = relayer.get_transaction(tx_id)
             if isinstance(status, list):
                 status = status[0]
             state = status.get("state", "")
             if "CONFIRMED" in state:
-                log.info("  Redeem CONFIRMED: %s", status.get("transactionHash", "")[:20])
+                tx_hash = status.get("transactionHash", "")
+                log.info("  Redeem CONFIRMED: %s", tx_hash[:20])
+                emit_event(
+                    "redeem_confirmed",
+                    {
+                        "tx_id": tx_id,
+                        "tx_hash": tx_hash,
+                    },
+                )
                 return True
             if "FAILED" in state or "INVALID" in state:
-                log.error("  Redeem FAILED: %s", status.get("errorMsg", "")[:80])
+                msg = status.get("errorMsg", "")[:80]
+                log.error("  Redeem FAILED: %s", msg)
+                emit_event(
+                    "redeem_failed",
+                    {
+                        "tx_id": tx_id,
+                        "state": state,
+                        "error": msg,
+                    },
+                )
                 return False
         log.warning("  Redeem timeout — check manually")
+        emit_event("redeem_timeout", {"tx_id": tx_id})
         return False
     except Exception as e:
         log.error("  Redeem error: %s", e)
+        emit_event("redeem_error", {"error": str(e)})
         return False
 
 
@@ -316,6 +405,18 @@ def check_token_balance(client, token_id: str) -> float:
         return 0.0
 
 
+def check_usdc_balance(client) -> float:
+    """Check available USDC balance via CLOB API."""
+    from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+    try:
+        bal = client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        return int(bal.get("balance", "0")) / 1e6
+    except Exception:
+        return -1.0
+
+
 async def try_redeem_all(client, relayer, past_markets: dict):
     """Check all past markets and redeem any with unredeemed balances."""
     if not relayer:
@@ -326,7 +427,7 @@ async def try_redeem_all(client, relayer, past_markets: dict):
         if info.get("redeemed"):
             continue
 
-        slug = f"btc-updown-15m-{ts}"
+        slug = f"{cfg.asset}-updown-15m-{ts}"
         try:
             mkt = await get_market_info(slug)
         except Exception:
@@ -336,14 +437,23 @@ async def try_redeem_all(client, relayer, past_markets: dict):
             continue  # not resolved yet
 
         # Check if we hold any tokens
-        up_bal = check_token_balance(client,mkt["up_token"])
-        dn_bal = check_token_balance(client,mkt["dn_token"])
+        up_bal = check_token_balance(client, mkt["up_token"])
+        dn_bal = check_token_balance(client, mkt["dn_token"])
 
         if up_bal <= 0 and dn_bal <= 0:
             info["redeemed"] = True  # nothing to redeem
             continue
 
         log.info("  Redeeming %s (UP=%.1f, DN=%.1f)...", mkt["title"][:50], up_bal, dn_bal)
+        emit_event(
+            "redeem_started",
+            {
+                "slug": slug,
+                "market_ts": ts,
+                "up_bal": up_bal,
+                "dn_bal": dn_bal,
+            },
+        )
         ok = redeem_market(relayer, mkt["conditionId"], mkt.get("neg_risk", False))
         if ok:
             info["redeemed"] = True
@@ -351,13 +461,21 @@ async def try_redeem_all(client, relayer, past_markets: dict):
 
     if redeemed:
         log.info("  Redeemed %d market(s)", len(redeemed))
+        emit_event("redeemed", {"markets": redeemed})
 
 
 async def run():
+    cfg = load_config()
+    emit_event("status", {"message": "bot_starting", "config": asdict(cfg)})
     log.info("Initializing SDK...")
     client = init_clob_client()
     relayer = init_relayer()
-    log.info("SDK ready. Placing 45c orders on BTC 15m markets.")
+    log.info(
+        "SDK ready. Placing %.2fc orders on %s 15m markets (%.0f shares/side).",
+        cfg.price,
+        cfg.asset.upper(),
+        cfg.shares_per_side,
+    )
     if relayer:
         log.info("Auto-redeem enabled (gasless relayer).\n")
     else:
@@ -377,7 +495,7 @@ async def run():
     while scan_ts < now - 7200:
         scan_ts += 900
     while scan_ts < now:
-        slug = f"btc-updown-15m-{scan_ts}"
+        slug = f"{cfg.asset}-updown-15m-{scan_ts}"
         try:
             mkt = await get_market_info(slug)
             past_markets[scan_ts] = {
@@ -393,13 +511,14 @@ async def run():
 
     while True:
         now = int(time.time())
+
         timestamps = next_market_timestamps(now)
 
         for ts in timestamps:
             if ts in placed_markets:
                 continue
 
-            slug = f"btc-updown-15m-{ts}"
+            slug = f"{cfg.asset}-updown-15m-{ts}"
 
             try:
                 mkt = await get_market_info(slug)
@@ -416,6 +535,15 @@ async def run():
             log.info("  UP token:  %s...", mkt["up_token"][:20])
             log.info("  DN token:  %s...", mkt["dn_token"][:20])
             log.info("")
+            emit_event(
+                "market_entered",
+                {
+                    "slug": slug,
+                    "market_ts": ts,
+                    "title": mkt["title"],
+                    "starts_in": max(0, secs_until),
+                },
+            )
 
             # Subscribe to WS feed for this market's tokens
             if not ws_feed.is_connected:
@@ -447,25 +575,95 @@ async def run():
             except Exception:
                 pass  # if check fails, proceed with placement
 
-            up_id = place_order(client, mkt["up_token"], "UP  ", SHARES_PER_SIDE, PRICE)
-            dn_id = place_order(client, mkt["dn_token"], "DOWN", SHARES_PER_SIDE, PRICE)
+            # Pre-entry gate: skip if combined ask too tight (no edge)
+            try:
+                up_book = client.get_order_book(mkt["up_token"])
+                dn_book = client.get_order_book(mkt["dn_token"])
+                up_best_ask = min(float(a.price) for a in up_book.asks) if up_book.asks else None
+                dn_best_ask = min(float(a.price) for a in dn_book.asks) if dn_book.asks else None
+                if up_best_ask is not None and dn_best_ask is not None:
+                    combined_ask = up_best_ask + dn_best_ask
+                    if combined_ask >= cfg.max_combined_ask:
+                        log.info("  SKIP: combined ask %.3f >= %.2f (no edge)", combined_ask, cfg.max_combined_ask)
+                        emit_event(
+                            "market_skipped",
+                            {
+                                "slug": slug,
+                                "market_ts": ts,
+                                "reason": "no_edge",
+                                "combined_ask": combined_ask,
+                                "max_combined_ask": cfg.max_combined_ask,
+                            },
+                        )
+                        placed_markets.add(ts)
+                        past_markets[ts] = {"redeemed": False, "up_token": mkt["up_token"], "dn_token": mkt["dn_token"]}
+                        continue
+                    log.info("  Edge check: combined ask=%.3f (edge=%.3f)", combined_ask, 1.0 - combined_ask)
+                    emit_event(
+                        "edge_check",
+                        {
+                            "slug": slug,
+                            "market_ts": ts,
+                            "combined_ask": combined_ask,
+                            "edge": 1.0 - combined_ask,
+                        },
+                    )
+            except Exception as e:
+                log.warning("  Pre-entry gate failed: %s (proceeding anyway)", e)
+
+            up_id = place_order(client, mkt["up_token"], "UP  ", cfg.shares_per_side, cfg.price)
+            if up_id:
+                emit_event(
+                    "order_placed",
+                    {
+                        "slug": slug,
+                        "market_ts": ts,
+                        "side": "UP",
+                        "shares": cfg.shares_per_side,
+                        "price": cfg.price,
+                        "order_id": up_id,
+                    },
+                )
+
+            dn_id = place_order(client, mkt["dn_token"], "DOWN", cfg.shares_per_side, cfg.price)
+            if dn_id:
+                emit_event(
+                    "order_placed",
+                    {
+                        "slug": slug,
+                        "market_ts": ts,
+                        "side": "DOWN",
+                        "shares": cfg.shares_per_side,
+                        "price": cfg.price,
+                        "order_id": dn_id,
+                    },
+                )
 
             placed = (1 if up_id else 0) + (1 if dn_id else 0)
-            log.info("  Done: %d orders placed. Max cost: $%.2f", placed, SHARES_PER_SIDE * PRICE * 2)
+            log.info("  Done: %d orders placed. Max cost: $%.2f", placed, cfg.shares_per_side * cfg.price * 2)
             log.info("")
 
             placed_markets.add(ts)
             past_markets[ts] = {"redeemed": False, "up_token": mkt["up_token"], "dn_token": mkt["dn_token"]}
 
-        # Log WS prices for active markets
+        # Log WS prices for active markets and emit price updates (throttled by loop interval)
         for ts, info in past_markets.items():
             if info.get("bailed") or info.get("redeemed"):
                 continue
             up_ask = ws_feed.get_best_ask(info.get("up_token", ""))
             dn_ask = ws_feed.get_best_ask(info.get("dn_token", ""))
             if up_ask is not None or dn_ask is not None:
-                log.info("  [%d] WS prices: UP ask=%.2f  DN ask=%.2f",
-                         ts, up_ask or 0, dn_ask or 0)
+                up_v = up_ask or 0
+                dn_v = dn_ask or 0
+                log.info("  [%d] WS prices: UP ask=%.2f  DN ask=%.2f", ts, up_v, dn_v)
+                emit_event(
+                    "price_update",
+                    {
+                        "market_ts": ts,
+                        "up_ask": up_v,
+                        "dn_ask": dn_v,
+                    },
+                )
 
         # Bail-out disabled — holding through resolution is +EV at 45c entry
         # await check_bail_out(client, ws_feed, past_markets)

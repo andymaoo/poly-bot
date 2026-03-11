@@ -5,3 +5,7 @@ py-builder-relayer-client
 web3
 eth-abi
 websockets
+fastapi
+uvicorn[standard]
+aiofiles
+watchdog
