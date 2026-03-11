@@ -2,7 +2,7 @@
   "price": 0.45,
   "shares_per_side": 60,
   "bail_price": 0.72,
-  "max_combined_ask": 0.98,
+  "max_combined_ask": 1.01,
   "order_expiry_seconds": 300,
   "asset": "btc",
   "bail_enabled": true,
